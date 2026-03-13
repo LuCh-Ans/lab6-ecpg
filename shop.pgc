@@ -1,0 +1,499 @@
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <cstdlib>
+#include <iomanip>
+#include <limits>
+
+using namespace std;
+
+EXEC SQL INCLUDE sqlca;
+
+// Утилиты
+
+namespace util {
+
+void print_error() {
+    if (sqlca.sqlcode != 0) {
+        string msg(sqlca.sqlerrm.sqlerrmc);
+        if (msg.find("permission denied") != string::npos || msg.find("42501") != string::npos) {
+            cout << "\nНедостаточно прав. Операция доступна только администратору." << endl;
+        } else {
+            cout << "\nОшибка SQL: " << msg << endl;
+        }
+    }
+}
+
+string read_line(const string &prompt) {
+    cout << prompt;
+    string line;
+    getline(cin, line);
+    return line;
+}
+
+int read_int(const string &prompt) {
+    cout << prompt;
+    int val;
+    if (!(cin >> val)) {
+        cin.clear();
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        return -1;
+    }
+    cin.ignore(numeric_limits<streamsize>::max(), '\n');
+    return val;
+}
+
+double read_double(const string &prompt) {
+    cout << prompt;
+    double val;
+    if (!(cin >> val)) {
+        cin.clear();
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        return -1.0;
+    }
+    cin.ignore(numeric_limits<streamsize>::max(), '\n');
+    return val;
+}
+
+void trim(char *s) {
+    int len = strlen(s);
+    while (len > 0 && s[len - 1] == ' ') len--;
+    s[len] = '\0';
+}
+
+void print_table_header() {
+    cout << left
+         << setw(5)  << "ID" << "| "
+         << setw(30) << "Название" << "| "
+         << setw(20) << "Бренд" << "| "
+         << setw(15) << "Категория" << "| "
+         << right << setw(10) << "Цена" << " | "
+         << "Наличие" << endl;
+    cout << string(90, '-') << endl;
+}
+
+void print_table_row(int id, const char *name, const char *brand, const char *category, double price, int in_stock) {
+    auto utf8_extra = [](const char *s) -> int {
+        int bytes = strlen(s);
+        int chars = 0;
+        for (int i = 0; s[i]; i++)
+            if ((s[i] & 0xC0) != 0x80) chars++;
+        return bytes - chars;
+    };
+
+    cout << left
+         << setw(5)  << id << "| "
+         << setw(30 + utf8_extra(name)) << name << "| "
+         << setw(20 + utf8_extra(brand)) << brand << "| "
+         << setw(15 + utf8_extra(category)) << category << "| "
+         << right << fixed << setprecision(2) << setw(10) << price << " | "
+         << (in_stock ? "Да" : "Нет") << endl;
+}
+}
+
+//Класс ShopDB
+
+class ShopDB {
+    bool connected_ = false;
+
+public:
+    bool is_connected() const { return connected_; }
+
+    //Подключение / отключение
+
+    bool connect(const string &user, const string &password) {
+        EXEC SQL BEGIN DECLARE SECTION;
+        char conn_user[128];
+        char conn_pwd[128];
+        const char *conn_db = "shop_db";
+        EXEC SQL END DECLARE SECTION;
+
+        strncpy(conn_user, user.c_str(), sizeof(conn_user) - 1);
+        conn_user[sizeof(conn_user) - 1] = '\0';
+        strncpy(conn_pwd, password.c_str(), sizeof(conn_pwd) - 1);
+        conn_pwd[sizeof(conn_pwd) - 1] = '\0';
+
+        EXEC SQL CONNECT TO :conn_db USER :conn_user USING :conn_pwd;
+
+        if (sqlca.sqlcode != 0) {
+            cout << "Не удалось подключиться: " << sqlca.sqlerrm.sqlerrmc << endl;
+            return false;
+        }
+        connected_ = true;
+        cout << "Подключено к shop_db как " << user << endl;
+        return true;
+    }
+
+    void disconnect() {
+        EXEC SQL DISCONNECT ALL;
+        connected_ = false;
+    }
+
+    // CREATE / DROP DATABASE единственные два SQL-оператора, которые вызываются напрямую
+
+    void create_database() {
+        EXEC SQL BEGIN DECLARE SECTION;
+        char su_user[128];
+        char su_pwd[128];
+        const char *postgres_db = "postgres";
+        EXEC SQL END DECLARE SECTION;
+
+        cout << "\nСоздание базы данных shop_db" << endl;
+        string user = util::read_line("Суперпользователь PostgreSQL: ");
+        string pwd  = util::read_line("Пароль: ");
+        strncpy(su_user, user.c_str(), sizeof(su_user) - 1);
+        su_user[sizeof(su_user) - 1] = '\0';
+        strncpy(su_pwd,  pwd.c_str(),  sizeof(su_pwd) - 1);
+        su_pwd[sizeof(su_pwd) - 1] = '\0';
+
+        EXEC SQL DISCONNECT ALL;
+        connected_ = false;
+
+        EXEC SQL CONNECT TO :postgres_db USER :su_user USING :su_pwd;
+        if (sqlca.sqlcode != 0) {
+            cout << "Не удалось подключиться к postgres: "
+                 << sqlca.sqlerrm.sqlerrmc << endl;
+            return;
+        }
+
+        EXEC SQL SET AUTOCOMMIT TO ON;
+        EXEC SQL CREATE DATABASE shop_db;
+
+        if (sqlca.sqlcode != 0) {
+            string msg(sqlca.sqlerrm.sqlerrmc);
+            if (msg.find("already exists") != string::npos)
+                cout << "[i] База данных shop_db уже существует." << endl;
+            else {
+                util::print_error();
+                EXEC SQL DISCONNECT ALL;
+                return;
+            }
+        } else {
+            cout << "База данных shop_db создана." << endl;
+        }
+
+        EXEC SQL DISCONNECT ALL;
+
+        // Инициализация через psql
+        cout << "Инициализация (init.sql)..." << endl;
+        string cmd = "PGPASSWORD='" + pwd + "' psql -h localhost -U " + user + " -d shop_db -f init.sql 2>&1";
+        int rc = system(cmd.c_str());
+        if (rc == 0)
+            cout << " Инициализация завершена." << endl;
+        else
+            cout << "Ошибка при выполнении init.sql (код " << rc << ")." << endl;
+    }
+
+    void drop_database() {
+        EXEC SQL BEGIN DECLARE SECTION;
+        char su_user[128];
+        char su_pwd[128];
+        const char *postgres_db = "postgres";
+        EXEC SQL END DECLARE SECTION;
+
+        cout << "\nУдаление базы данных shop_db" << endl;
+        string user = util::read_line("Суперпользователь PostgreSQL: ");
+        string pwd  = util::read_line("Пароль: ");
+        strncpy(su_user, user.c_str(), sizeof(su_user) - 1);
+        su_user[sizeof(su_user) - 1] = '\0';
+        strncpy(su_pwd,  pwd.c_str(),  sizeof(su_pwd) - 1);
+        su_pwd[sizeof(su_pwd) - 1] = '\0';
+
+        EXEC SQL DISCONNECT ALL;
+        connected_ = false;
+
+        EXEC SQL CONNECT TO :postgres_db USER :su_user USING :su_pwd;
+        if (sqlca.sqlcode != 0) {
+            cout << "Не удалось подключиться: " << sqlca.sqlerrm.sqlerrmc << endl;
+            return;
+        }
+
+        EXEC SQL SET AUTOCOMMIT TO ON;
+
+        EXEC SQL SELECT pg_terminate_backend(pid)
+                 FROM pg_stat_activity
+                 WHERE datname = 'shop_db' AND pid <> pg_backend_pid();
+
+        EXEC SQL DROP DATABASE IF EXISTS shop_db;
+        if (sqlca.sqlcode != 0)
+            util::print_error();
+        else
+            cout << "База данных shop_db удалена." << endl;
+
+        EXEC SQL DISCONNECT ALL;
+    }
+
+    //Хранимые процедуры
+
+    void clear_table() {
+        cout << "\nОчистка таблицы" << endl;
+        EXEC SQL CALL sp_clear_table();
+        if (sqlca.sqlcode != 0) util::print_error();
+        else cout << "Таблица очищена" << endl;
+    }
+
+    void add_product() {
+        EXEC SQL BEGIN DECLARE SECTION;
+        char p_name[256];
+        char p_brand[256];
+        char p_category[128];
+        double p_price;
+        int p_in_stock;
+        EXEC SQL END DECLARE SECTION;
+
+        cout << "\nДобавление товара"<< endl;
+        string name = util::read_line("Название: ");
+        string brand = util::read_line("Бренд: ");
+        string category = util::read_line("Категория: ");
+        p_price = util::read_double("Цена: ");
+        p_in_stock = util::read_int("В наличии (1/0): ");
+
+        strncpy(p_name, name.c_str(), sizeof(p_name) - 1);
+        p_name[sizeof(p_name) - 1] = '\0';
+        strncpy(p_brand, brand.c_str(), sizeof(p_brand) - 1);
+        p_brand[sizeof(p_brand) - 1] = '\0';
+        strncpy(p_category, category.c_str(), sizeof(p_category) - 1);
+        p_category[sizeof(p_category) - 1] = '\0';
+
+        EXEC SQL CALL sp_add_product(:p_name, :p_brand, :p_category, :p_price, CAST(:p_in_stock AS BOOLEAN));
+        if (sqlca.sqlcode != 0) util::print_error();
+        else cout << "Товар добавлен." << endl;
+    }
+
+    void show_all() {
+        EXEC SQL BEGIN DECLARE SECTION;
+        int v_id;
+        char v_name[256];
+        char v_brand[256];
+        char v_category[128];
+        double v_price;
+        char v_in_stock[2];
+        EXEC SQL END DECLARE SECTION;
+
+        cout << "\nВсе товары" << endl;
+        util::print_table_header();
+
+        EXEC SQL DECLARE cur_all CURSOR FOR
+            SELECT * FROM fn_get_all_products();
+        EXEC SQL OPEN cur_all;
+
+        if (sqlca.sqlcode != 0) { util::print_error(); return; }
+
+        while (true) {
+            EXEC SQL FETCH cur_all INTO :v_id, :v_name, :v_brand, :v_category, :v_price, :v_in_stock;
+            if (sqlca.sqlcode == 100) break;
+            if (sqlca.sqlcode != 0) { util::print_error(); break; }
+
+            util::trim(v_name);
+            util::trim(v_brand);
+            util::trim(v_category);
+            util::print_table_row(v_id, v_name, v_brand, v_category, v_price, v_in_stock[0] == 't' ? 1 : 0);
+        }
+
+        EXEC SQL CLOSE cur_all;
+    }
+
+    void search_by_brand() {
+        EXEC SQL BEGIN DECLARE SECTION;
+        char s_brand[256];
+        int v_id;
+        char v_name[256];
+        char v_brand[256];
+        char v_category[128];
+        double v_price;
+        char v_in_stock[2];
+        EXEC SQL END DECLARE SECTION;
+
+        cout << "\nПоиск по бренду" << endl;
+        string brand = util::read_line("Бренд: ");
+        strncpy(s_brand, brand.c_str(), sizeof(s_brand) - 1);
+        s_brand[sizeof(s_brand) - 1] = '\0';
+
+        util::print_table_header();
+
+        EXEC SQL DECLARE cur_search CURSOR FOR
+            SELECT * FROM fn_search_by_brand(:s_brand);
+        EXEC SQL OPEN cur_search;
+
+        if (sqlca.sqlcode != 0) { util::print_error(); return; }
+
+        int count = 0;
+        while (true) {
+            EXEC SQL FETCH cur_search INTO :v_id, :v_name, :v_brand, :v_category, :v_price, :v_in_stock;
+            if (sqlca.sqlcode == 100) break;
+            if (sqlca.sqlcode != 0) { util::print_error(); break; }
+
+            util::trim(v_name);
+            util::trim(v_brand);
+            util::trim(v_category);
+            util::print_table_row(v_id, v_name, v_brand, v_category, v_price, v_in_stock[0] == 't' ? 1 : 0);
+            count++;
+        }
+
+        EXEC SQL CLOSE cur_search;
+        cout << "Найдено: " << count << endl;
+    }
+
+    void update_product() {
+        EXEC SQL BEGIN DECLARE SECTION;
+        int p_id;
+        char p_name[256];
+        char p_brand[256];
+        char p_category[128];
+        double p_price;
+        int p_in_stock;
+        EXEC SQL END DECLARE SECTION;
+
+        cout << "\nОбновление товара" << endl;
+        p_id = util::read_int("ID товара: ");
+        if (p_id < 0) { cout << "Некорректный ID" << endl; return; }
+
+        string name = util::read_line("Новое название: ");
+        string brand = util::read_line("Новый бренд: ");
+        string category = util::read_line("Новая категория: ");
+        p_price = util::read_double("Новая цена: ");
+        p_in_stock = util::read_int("В наличии (1/0): ");
+
+        strncpy(p_name, name.c_str(), sizeof(p_name) - 1);
+        p_name[sizeof(p_name) - 1] = '\0';
+        strncpy(p_brand, brand.c_str(), sizeof(p_brand) - 1);
+        p_brand[sizeof(p_brand) - 1] = '\0';
+        strncpy(p_category, category.c_str(), sizeof(p_category) - 1);
+        p_category[sizeof(p_category) - 1] = '\0';
+
+        EXEC SQL CALL sp_update_product(:p_id, :p_name, :p_brand, :p_category, :p_price, CAST(:p_in_stock AS BOOLEAN));
+        if (sqlca.sqlcode != 0) util::print_error();
+        else cout << "Товар обновлён" << endl;
+    }
+
+    void delete_by_brand() {
+        EXEC SQL BEGIN DECLARE SECTION;
+        char p_brand[256];
+        EXEC SQL END DECLARE SECTION;
+
+        cout << "\nУдаление по бренду" << endl;
+        string brand = util::read_line("Бренд для удаления: ");
+        strncpy(p_brand, brand.c_str(), sizeof(p_brand) - 1);
+        p_brand[sizeof(p_brand) - 1] = '\0';
+
+        EXEC SQL CALL sp_delete_by_brand(:p_brand);
+        if (sqlca.sqlcode != 0) util::print_error();
+        else cout << "Товары бренда '" << brand << "' удалены" << endl;
+    }
+
+    void create_user() {
+        EXEC SQL BEGIN DECLARE SECTION;
+        char new_user[128];
+        char new_pwd[128];
+        char new_role[16];
+        EXEC SQL END DECLARE SECTION;
+
+        cout << "\nСоздание пользователя" << endl;
+        string user = util::read_line("Имя пользователя: ");
+        string pwd  = util::read_line("Пароль: ");
+        string role = util::read_line("Роль (admin/guest): ");
+
+        strncpy(new_user, user.c_str(), sizeof(new_user) - 1);
+        new_user[sizeof(new_user) - 1] = '\0';
+        strncpy(new_pwd,  pwd.c_str(),  sizeof(new_pwd) - 1);
+        new_pwd[sizeof(new_pwd) - 1] = '\0';
+        strncpy(new_role, role.c_str(), sizeof(new_role) - 1);
+        new_role[sizeof(new_role) - 1] = '\0';
+
+        EXEC SQL CALL sp_create_user(:new_user, :new_pwd, :new_role);
+        if (sqlca.sqlcode != 0) util::print_error();
+        else cout << "Пользователь '" << user
+                  << "' создан с ролью '" << role << "'." << endl;
+    }
+};
+
+// Главное меню
+
+void print_menu() {
+    cout << "\n"
+         << " Золотое Яблоко — Управление товарами\n"
+         << " 1. Создать базу данных\n"
+         << " 2. Удалить базу данных\n"
+         << " 3. Подключиться к БД\n"
+         << " 4. Очистить таблицу\n"
+         << " 5. Добавить товар\n"
+         << " 6. Показать все товары\n"
+         << " 7. Поиск по бренду\n"
+         << " 8. Обновить товар\n"
+         << " 9. Удалить по бренду\n"
+         << " 10. Создать пользователя\n"
+         << " 0. Выход \n";
+}
+
+int main() {
+    ShopDB db;
+
+    cout << "Золотое Яблоко" << endl;
+
+    while (true) {
+        print_menu();
+        int choice = util::read_int("Выберите действие: ");
+
+        switch (choice) {
+        case 0:
+            db.disconnect();
+            cout << "До свидания!" << endl;
+            return 0;
+
+        case 1:
+            db.create_database();
+            break;
+
+        case 2:
+            db.drop_database();
+            break;
+
+        case 3: {
+            if (db.is_connected()) db.disconnect();
+            string user = util::read_line("Пользователь: ");
+            string pwd  = util::read_line("Пароль: ");
+            db.connect(user, pwd);
+            break;
+        }
+
+        case 4:
+            if (!db.is_connected()) { cout << "Сначала подключитесь (пункт 3)" << endl; break; }
+            db.clear_table();
+            break;
+
+        case 5:
+            if (!db.is_connected()) { cout << "Сначала подключитесь (пункт 3)" << endl; break; }
+            db.add_product();
+            break;
+
+        case 6:
+            if (!db.is_connected()) { cout << "Сначала подключитесь (пункт 3)" << endl; break; }
+            db.show_all();
+            break;
+
+        case 7:
+            if (!db.is_connected()) { cout << "Сначала подключитесь (пункт 3)" << endl; break; }
+            db.search_by_brand();
+            break;
+
+        case 8:
+            if (!db.is_connected()) { cout << "Сначала подключитесь (пункт 3)" << endl; break; }
+            db.update_product();
+            break;
+
+        case 9:
+            if (!db.is_connected()) { cout << "Сначала подключитесь (пункт 3)" << endl; break; }
+            db.delete_by_brand();
+            break;
+
+        case 10:
+            if (!db.is_connected()) { cout << "Сначала подключитесь (пункт 3)" << endl; break; }
+            db.create_user();
+            break;
+
+        default:
+            cout << "Неизвестный пункт меню" << endl;
+            break;
+        }
+    }
+}
